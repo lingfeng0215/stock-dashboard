@@ -315,29 +315,33 @@ with st.container(key="config_sticky"):
             matches = stock_list[
                 stock_list["代码"].str.contains(search, na=False) |
                 stock_list["名称"].str.contains(search, na=False)
-            ].head(6)
-            if matches.empty:
-                st.caption("未找到匹配股票")
+            ].head(20)
+
+            # 过滤掉已选的股票
+            available = [
+                row for _, row in matches.iterrows()
+                if (row["代码"], row["名称"]) not in st.session_state.selected_stocks
+            ]
+
+            if not available:
+                st.caption("匹配的股票都已在已选列表中")
+            elif len(st.session_state.selected_stocks) >= 10:
+                st.caption("⚠️ 已达上限（10 只）")
             else:
-                if len(st.session_state.selected_stocks) >= 10:
-                    st.caption("⚠️ 已达上限（10 只）")
-                else:
-                    for _, row in matches.iterrows():
-                        code = row["代码"]
-                        name = row["名称"]
-                        already_selected = (code, name) in st.session_state.selected_stocks
-                        already_wl = (code, name) in watchlist
-                        c1, c2, c3 = st.columns([6, 1, 1])
-                        c1.markdown(f"{code} {name}")
-                        if c2.button("➕", key=f"add_{code}", help="加入对比"):
-                            if not already_selected and len(st.session_state.selected_stocks) < 10:
-                                st.session_state.selected_stocks.append((code, name))
-                                st.session_state.has_result = False
-                                st.rerun()
-                        if not already_wl:
-                            if c3.button("⭐", key=f"star_{code}", help="加入自选"):
-                                add_stock(current_user, code, name)
-                                st.rerun()
+                for row in available[:6]:
+                    code = row["代码"]
+                    name = row["名称"]
+                    already_wl = (code, name) in watchlist
+                    c1, c2, c3 = st.columns([6, 1, 1])
+                    c1.markdown(f"{code} {name}")
+                    if c2.button("➕", key=f"add_{code}", help="加入对比"):
+                        st.session_state.selected_stocks.append((code, name))
+                        st.session_state.has_result = False
+                        st.rerun()
+                    if not already_wl:
+                        if c3.button("⭐", key=f"star_{code}", help="加入自选"):
+                            add_stock(current_user, code, name)
+                            st.rerun()
 
         st.markdown("---")
 
@@ -353,22 +357,28 @@ with st.container(key="config_sticky"):
             if board_stocks.empty:
                 st.caption("该板块暂无数据，请换一个板块")
             else:
-                st.caption(f"共 {len(board_stocks)} 只成分股，显示前 20 只：")
-                for _, row in board_stocks.head(20).iterrows():
-                    code = row["代码"]
-                    name = row["名称"]
-                    already_selected = (code, name) in st.session_state.selected_stocks
-                    c1, c2, c3 = st.columns([6, 1, 1])
-                    c1.markdown(f"{code} {name}")
-                    if c2.button("➕", key=f"badd_{code}"):
-                        if not already_selected and len(st.session_state.selected_stocks) < 10:
-                            st.session_state.selected_stocks.append((code, name))
-                            st.session_state.has_result = False
-                            st.rerun()
-                    if (code, name) not in watchlist:
-                        if c3.button("⭐", key=f"bstar_{code}"):
-                            add_stock(current_user, code, name)
-                            st.rerun()
+                board_available = [
+                    row for _, row in board_stocks.iterrows()
+                    if (row["代码"], row["名称"]) not in st.session_state.selected_stocks
+                ]
+                if not board_available:
+                    st.caption("该板块股票都已在已选列表中")
+                else:
+                    st.caption(f"共 {len(board_stocks)} 只成分股，显示前 20 只：")
+                    for row in board_available[:20]:
+                        code = row["代码"]
+                        name = row["名称"]
+                        c1, c2, c3 = st.columns([6, 1, 1])
+                        c1.markdown(f"{code} {name}")
+                        if c2.button("➕", key=f"badd_{code}"):
+                            if len(st.session_state.selected_stocks) < 10:
+                                st.session_state.selected_stocks.append((code, name))
+                                st.session_state.has_result = False
+                                st.rerun()
+                        if (code, name) not in watchlist:
+                            if c3.button("⭐", key=f"bstar_{code}"):
+                                add_stock(current_user, code, name)
+                                st.rerun()
 
     # --- 日期 Tab ---
     with tab_date:
