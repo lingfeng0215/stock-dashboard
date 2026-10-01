@@ -1,0 +1,19 @@
+credentials:
+  usernames:
+    admin:
+      email: admin@example.com
+      name: 管理员
+      password: "$2b$12$gubQlOfS0dwn67dugF8SquSgDGdxQhYWuOKwczEzN6LtQblyzqPdC"
+      role: admin
+    buyer001:
+      email: buyer001@example.com
+      name: 买家001
+      password: "$2b$12$E0k21Hwqc6aw/sOrmvDFPOBZ1cseYblsS.1BQx.UUNMJC0T8Si/Ti"
+      role: buyer
+cookie:
+  expiry_days: 30
+  key: stock_dashboard_secret_key_2026_secure_random_string_abcdefg
+  name: stock_dashboard_v2
+pre_authorized:
+  emails:
+    - admin@example.com
