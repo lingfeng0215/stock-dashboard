@@ -5,10 +5,10 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
-import secrets
 import streamlit_authenticator as stauth
 import yaml
 from yaml.loader import SafeLoader
+from db import init_db, add_stock, remove_stock, get_watchlist
 
 st.set_page_config(page_title="多股对比看板", layout="wide")
 
@@ -66,16 +66,15 @@ RANGE_SELECTOR = dict(
 )
 
 RANGE_SLIDER = dict(
-    visible=True,
-    thickness=0.07,
+    visible=True, thickness=0.07,
     bgcolor="rgba(80,80,80,0.4)",
-    bordercolor="rgba(150,150,150,0.5)",
-    borderwidth=1,
+    bordercolor="rgba(150,150,150,0.5)", borderwidth=1,
 )
 
-RANGE_BREAKS = [
-    dict(bounds=["sat", "mon"]),
-]
+RANGE_BREAKS = [dict(bounds=["sat", "mon"])]
+
+# ========== 初始化数据库 ==========
+init_db()
 
 # ========== 认证系统 ==========
 with open('.streamlit/config.yaml', encoding='utf-8') as file:
@@ -107,12 +106,14 @@ if st.session_state.get('authentication_status') is not True:
     st.caption("本工具仅提供历史数据对比展示，不构成任何投资建议。")
     st.stop()
 
-# 已登录，侧边栏显示用户信息和退出按钮
+current_user = st.session_state.get('username', 'unknown')
+current_name = st.session_state.get('name', '用户')
+
 with st.sidebar:
-    st.markdown(f"**当前用户：{st.session_state.get('name', '用户')}**")
+    st.markdown(f"**当前用户：{current_name}**")
     authenticator.logout('退出登录', 'sidebar')
 
-# ========== 数据获取函数 ==========
+# ========== 缓存函数 ==========
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_stock_list():
     try:
@@ -124,7 +125,52 @@ def get_stock_list():
     except Exception:
         return pd.DataFrame(columns=["代码", "名称"])
 
-stock_list = get_stock_list()
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_realtime_data():
+    """全A股实时行情快照，使用新浪财经接口"""
+    try:
+        df = ak.stock_zh_a_spot()
+        column_mapping = {
+            'code': '代码', 'name': '名称', 'trade': '最新价',
+            'pricechange': '涨跌额', 'changepercent': '涨跌幅',
+            'buy': '买入', 'sell': '卖出', 'settlement': '昨收',
+            'open': '今开', 'high': '最高', 'low': '最低',
+            'volume': '成交量', 'amount': '成交额', 'ticktime': '时间',
+            'per': '市盈率', 'pb': '市净率',
+            'mktcap': '总市值', 'nmc': '流通市值',
+            'turnoverratio': '换手率',
+        }
+        df = df.rename(columns=column_mapping)
+        df["代码"] = df["代码"].astype(str).str.zfill(6)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_industry_boards():
+    """行业板块列表（硬编码，避免接口限流）"""
+    return [
+        "半导体", "白酒", "医药商业", "银行", "证券", "房地产开发",
+        "汽车整车", "消费电子", "光伏设备", "航天航空", "农牧饲渔",
+        "化学制品", "钢铁行业", "煤炭行业", "有色金属", "电力行业",
+        "食品饮料", "家用电器", "通信设备", "计算机设备", "传媒",
+        "保险", "石油行业", "环保行业", "旅游酒店"
+    ]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_board_stocks(board_name):
+    """某个行业板块的成分股"""
+    try:
+        df = ak.stock_board_industry_cons_em(symbol=board_name)
+        df = df[["代码", "名称"]].copy()
+        df["代码"] = df["代码"].astype(str).str.zfill(6)
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["代码", "名称"])
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_stock_data(symbol, start, end):
@@ -144,6 +190,7 @@ def fetch_stock_data(symbol, start, end):
     df = df.sort_values('日期').reset_index(drop=True)
     return df
 
+
 def friendly_error(name, code, err):
     msg = str(err)
     if "RemoteDisconnected" in msg or "Connection aborted" in msg or "ConnectionError" in msg:
@@ -155,36 +202,29 @@ def friendly_error(name, code, err):
     else:
         return f"⚠️ {name}（{code}）：获取失败，请稍后重试"
 
+
 def apply_chart_layout(fig, x_tick_format, x_nticks, is_candlestick=False):
     fig.update_layout(
-        template="plotly_dark",
-        hovermode="x unified",
-        dragmode='pan',
-        legend=dict(
-            orientation="h",
-            yanchor="bottom", y=1.05,
-            xanchor="right", x=1
-        ),
+        template="plotly_dark", hovermode="x unified", dragmode='pan',
+        legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="right", x=1),
         margin=dict(l=40, r=20, t=60, b=40),
     )
     if is_candlestick:
         fig.update_layout(xaxis_rangeslider_visible=False)
     fig.update_xaxes(
-        tickformat=x_tick_format,
-        nticks=x_nticks,
-        rangeselector=RANGE_SELECTOR,
-        rangeslider=RANGE_SLIDER,
+        tickformat=x_tick_format, nticks=x_nticks,
+        rangeselector=RANGE_SELECTOR, rangeslider=RANGE_SLIDER,
         rangebreaks=RANGE_BREAKS,
     )
     fig.update_yaxes(autorange=True)
     return fig
 
-# ========== 初始化 ==========
+
+# ========== 初始化 session state ==========
 if "selected_stocks" not in st.session_state:
     st.session_state.selected_stocks = [
         ("600519", "贵州茅台"),
         ("000858", "五粮液"),
-        ("601318", "中国平安"),
     ]
 if "has_result" not in st.session_state:
     st.session_state.has_result = False
@@ -193,30 +233,32 @@ if "start_date" not in st.session_state:
 if "end_date" not in st.session_state:
     st.session_state.end_date = datetime.now().date()
 
+stock_list = get_stock_list()
+
 # ========== 页面标题 ==========
 st.title("📈 多股对比看板")
-st.caption(f"当前用户：{st.session_state.get('name', '用户')} ｜ 本工具仅提供历史数据对比展示，不构成任何投资建议。")
+st.caption(f"当前用户：{current_name} ｜ 本工具仅提供历史数据对比展示，不构成任何投资建议。")
 
 with st.expander("📖 使用说明（点击展开）", expanded=False):
     st.markdown("""
-    **1. 选择股票**  
-    在下方「配置」区域，搜索框输入股票代码（如 `600519`）或名称（如 `茅台`），
-    从联想结果中点击添加。最多支持 10 只股票，按添加顺序编号。
+    **1. 选股**  
+    - 搜索框输入代码或名称，点击 ➕ 添加  
+    - 在「我的自选」里一键加载已保存的股票  
+    - 在「板块选股」里选行业，一键加载板块成分股
 
-    **2. 选择日期**  
-    可快捷选择近1月、近3月、近6月、近1年、近3年，也可手动选择起止日期。
+    **2. 日期**  
+    快捷选择或手动选择起止日期。
 
-    **3. 选择指标**  
-    在「指标」标签页勾选你关心的对比指标，不勾选则不显示。
+    **3. 指标**  
+    勾选关心的对比指标。
 
     **4. 开始分析**  
-    点击「开始分析」，等待数据加载，查看对比图表。
+    点击后等待数据加载，实时行情显示在顶部，对比图表在下方。
 
     **5. 图表操作**  
-    - 图表**顶部**：`[1月] [3月] [6月] [1年] [全部]` 快捷按钮。  
-    - 图表**底部**：拖动条，按住左右拖动浏览。  
-    - 图表**右上角**：`＋` 放大、`－` 缩小、`⟲` 重置视图。  
-    - 横坐标只显示交易日，周末自动隐藏。
+    - 顶部：`[1月] [3月] [6月] [1年] [全部]` 快捷按钮  
+    - 底部：拖动条，按住左右拖动  
+    - 右上角：`＋` `－` `⟲` 缩放按钮
     """)
 
 # ========== 粘性配置栏 ==========
@@ -224,9 +266,32 @@ with st.container(key="config_sticky"):
     st.markdown("### ⚙️ 配置")
     tab_stock, tab_date, tab_metrics = st.tabs(["📌 选股", "📅 日期", "📊 指标"])
 
+    # --- 选股 Tab ---
     with tab_stock:
+        # 我的自选
+        st.markdown("**⭐ 我的自选：**")
+        watchlist = get_watchlist(current_user)
+        if watchlist:
+            for code, name in watchlist:
+                c1, c2, c3 = st.columns([6, 1, 1])
+                c1.markdown(f"{name}（{code}）")
+                if c2.button("加载", key=f"wl_load_{code}"):
+                    if (code, name) not in st.session_state.selected_stocks:
+                        if len(st.session_state.selected_stocks) < 10:
+                            st.session_state.selected_stocks.append((code, name))
+                            st.session_state.has_result = False
+                            st.rerun()
+                if c3.button("✕", key=f"wl_del_{code}"):
+                    remove_stock(current_user, code)
+                    st.rerun()
+        else:
+            st.caption("暂无自选，搜索股票后点⭐添加")
+
+        st.markdown("---")
+
+        # 已选列表
+        st.markdown("**已选股票（最多10只）：**")
         if st.session_state.selected_stocks:
-            st.markdown("**已选股票（按顺序，最多10只）：**")
             for i, (code, name) in enumerate(st.session_state.selected_stocks, 1):
                 c1, c2 = st.columns([10, 1])
                 c1.markdown(f"**{i}.** {name}（{code}）")
@@ -235,9 +300,12 @@ with st.container(key="config_sticky"):
                     st.session_state.has_result = False
                     st.rerun()
         else:
-            st.caption("尚未选择股票，请在下方搜索添加")
+            st.caption("尚未选择股票")
 
-        st.markdown("**搜索添加股票：**")
+        st.markdown("---")
+
+        # 搜索添加
+        st.markdown("**🔍 搜索添加：**")
         search = st.text_input(
             "搜索股票", key="search_input",
             placeholder="输入代码或名称，如 600519 或 茅台",
@@ -247,7 +315,7 @@ with st.container(key="config_sticky"):
             matches = stock_list[
                 stock_list["代码"].str.contains(search, na=False) |
                 stock_list["名称"].str.contains(search, na=False)
-            ].head(8)
+            ].head(6)
             if matches.empty:
                 st.caption("未找到匹配股票")
             else:
@@ -257,13 +325,52 @@ with st.container(key="config_sticky"):
                     for _, row in matches.iterrows():
                         code = row["代码"]
                         name = row["名称"]
-                        if (code, name) in st.session_state.selected_stocks:
-                            continue
-                        if st.button(f"➕ {code} {name}", key=f"add_{code}", width='stretch'):
+                        already_selected = (code, name) in st.session_state.selected_stocks
+                        already_wl = (code, name) in watchlist
+                        c1, c2, c3 = st.columns([6, 1, 1])
+                        c1.markdown(f"{code} {name}")
+                        if c2.button("➕", key=f"add_{code}", help="加入对比"):
+                            if not already_selected and len(st.session_state.selected_stocks) < 10:
+                                st.session_state.selected_stocks.append((code, name))
+                                st.session_state.has_result = False
+                                st.rerun()
+                        if not already_wl:
+                            if c3.button("⭐", key=f"star_{code}", help="加入自选"):
+                                add_stock(current_user, code, name)
+                                st.rerun()
+
+        st.markdown("---")
+
+        # 板块选股
+        st.markdown("**🏭 板块选股：**")
+        boards = get_industry_boards()
+        selected_board = st.selectbox(
+            "选择行业板块", ["请选择..."] + boards, key="board_select",
+            label_visibility="collapsed"
+        )
+        if selected_board and selected_board != "请选择...":
+            board_stocks = get_board_stocks(selected_board)
+            if board_stocks.empty:
+                st.caption("该板块暂无数据，请换一个板块")
+            else:
+                st.caption(f"共 {len(board_stocks)} 只成分股，显示前 20 只：")
+                for _, row in board_stocks.head(20).iterrows():
+                    code = row["代码"]
+                    name = row["名称"]
+                    already_selected = (code, name) in st.session_state.selected_stocks
+                    c1, c2, c3 = st.columns([6, 1, 1])
+                    c1.markdown(f"{code} {name}")
+                    if c2.button("➕", key=f"badd_{code}"):
+                        if not already_selected and len(st.session_state.selected_stocks) < 10:
                             st.session_state.selected_stocks.append((code, name))
                             st.session_state.has_result = False
                             st.rerun()
+                    if (code, name) not in watchlist:
+                        if c3.button("⭐", key=f"bstar_{code}"):
+                            add_stock(current_user, code, name)
+                            st.rerun()
 
+    # --- 日期 Tab ---
     with tab_date:
         today = datetime.now().date()
         qc1, qc2, qc3, qc4, qc5 = st.columns(5)
@@ -293,6 +400,7 @@ with st.container(key="config_sticky"):
         with dc2:
             end_date = st.date_input("结束日期", key="end_date", format="YYYY/MM/DD")
 
+    # --- 指标 Tab ---
     with tab_metrics:
         mc1, mc2, mc3 = st.columns(3)
         with mc1:
@@ -333,6 +441,45 @@ else:
     resolved = st.session_state.selected_stocks
     total = len(resolved)
 
+    # ========== 实时行情卡片 ==========
+    st.markdown("### ⚡ 实时行情")
+    realtime_df = get_realtime_data()
+    if not realtime_df.empty:
+        selected_codes = [code for code, _ in resolved]
+        rt = realtime_df[realtime_df["代码"].isin(selected_codes)]
+
+        if not rt.empty:
+            rt_records = rt.to_dict("records")
+            rows = (len(rt_records) + 4) // 5
+            for r in range(rows):
+                cols = st.columns(min(5, len(rt_records) - r * 5))
+                for i, rec in enumerate(rt_records[r * 5: r * 5 + 5]):
+                    with cols[i]:
+                        latest = rec.get("最新价", "-")
+                        change_pct = rec.get("涨跌幅", 0)
+                        change_amt = rec.get("涨跌额", 0)
+                        try:
+                            delta_str = f"{float(change_amt):+.2f} ({float(change_pct):+.2f}%)"
+                        except Exception:
+                            delta_str = "-"
+                        st.metric(
+                            label=f"{rec.get('名称', '')}（{rec.get('代码', '')}）",
+                            value=f"{latest}",
+                            delta=delta_str
+                        )
+            with st.expander("📋 查看详细数据", expanded=False):
+                show_cols = ["代码", "名称", "最新价", "涨跌幅", "涨跌额",
+                             "成交量", "成交额", "换手率", "市盈率", "市净率"]
+                show_cols = [c for c in show_cols if c in rt.columns]
+                st.dataframe(rt[show_cols], width='stretch', hide_index=True)
+        else:
+            st.caption("无实时数据")
+    else:
+        st.caption("实时行情获取失败，不影响历史数据对比。")
+
+    st.markdown("---")
+
+    # ========== 历史数据获取 ==========
     progress_bar = st.progress(0, text="正在准备...")
     status_text = st.empty()
     data_dict = {}
@@ -374,63 +521,15 @@ else:
     date_span_days = (all_dates.max() - all_dates.min()).days
 
     if date_span_days <= 60:
-        x_tick_format = "%m.%d"
-        x_nticks = 10
+        x_tick_format = "%m.%d"; x_nticks = 10
     elif date_span_days <= 180:
-        x_tick_format = "%m.%d"
-        x_nticks = 8
+        x_tick_format = "%m.%d"; x_nticks = 8
     elif date_span_days <= 365:
-        x_tick_format = "%Y.%m"
-        x_nticks = 10
+        x_tick_format = "%Y.%m"; x_nticks = 10
     else:
-        x_tick_format = "%Y.%m"
-        x_nticks = 12
+        x_tick_format = "%Y.%m"; x_nticks = 12
 
-    st.markdown("### 📊 最新行情")
-    names = list(result.keys())
-    if len(names) <= 5:
-        cols = st.columns(len(names))
-        for i, name in enumerate(names):
-            df = result[name]
-            latest = df.iloc[-1]
-            if len(df) >= 2:
-                prev = df.iloc[-2]
-                change = latest["收盘"] - prev["收盘"]
-                pct = change / prev["收盘"] * 100
-                with cols[i]:
-                    st.metric(
-                        label=name,
-                        value=f"{latest['收盘']:.2f}",
-                        delta=f"{change:+.2f} ({pct:+.2f}%)"
-                    )
-            else:
-                with cols[i]:
-                    st.metric(label=name, value=f"{latest['收盘']:.2f}")
-    else:
-        card_data = []
-        for idx, name in enumerate(names, 1):
-            df = result[name]
-            latest = df.iloc[-1]
-            if len(df) >= 2:
-                prev = df.iloc[-2]
-                change = latest["收盘"] - prev["收盘"]
-                pct = change / prev["收盘"] * 100
-                card_data.append({
-                    "序号": idx, "股票": name,
-                    "最新价": f"{latest['收盘']:.2f}",
-                    "涨跌额": f"{change:+.2f}",
-                    "涨跌幅": f"{pct:+.2f}%"
-                })
-            else:
-                card_data.append({
-                    "序号": idx, "股票": name,
-                    "最新价": f"{latest['收盘']:.2f}",
-                    "涨跌额": "-", "涨跌幅": "-"
-                })
-        st.dataframe(pd.DataFrame(card_data), width='stretch', hide_index=True)
-
-    st.markdown("---")
-
+    # ========== 图表渲染 ==========
     for metric in price_metrics:
         st.subheader(f"📈 {metric}")
 
@@ -478,10 +577,7 @@ else:
                 increasing_line_color='#ff4b4b', decreasing_line_color='#00c853',
                 increasing_fillcolor='#ff4b4b', decreasing_fillcolor='#00c853'
             ))
-            fig.update_layout(
-                title=f"{kline_stock} K线图",
-                height=480, yaxis_title="价格（元）",
-            )
+            fig.update_layout(title=f"{kline_stock} K线图", height=480, yaxis_title="价格（元）")
             apply_chart_layout(fig, x_tick_format, x_nticks, is_candlestick=True)
             st.plotly_chart(fig, width='stretch', config=PLOTLY_CONFIG)
             st.caption("红色代表上涨，绿色代表下跌。")
@@ -497,10 +593,7 @@ else:
             for period in [5, 10, 20]:
                 ma = df['收盘'].rolling(period).mean()
                 fig.add_trace(go.Scatter(x=df.index, y=ma, mode="lines", name=f"MA{period}"))
-            fig.update_layout(
-                title=f"{ma_stock} 均线图",
-                height=450, yaxis_title="价格（元）",
-            )
+            fig.update_layout(title=f"{ma_stock} 均线图", height=450, yaxis_title="价格（元）")
             apply_chart_layout(fig, x_tick_format, x_nticks)
             st.plotly_chart(fig, width='stretch', config=PLOTLY_CONFIG)
 
